@@ -97,6 +97,8 @@ class DockerRunner:
             subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=15)
             reader.join(timeout=5)
+            if not reader.is_alive():
+                process.stdout.close()
         receipt = {"code": code, "code_sha256": hashlib.sha256(code.encode()).hexdigest(),
                    "exit_code": process.returncode, "timed_out": timed_out,
                    "output_truncated": overflow.is_set(),
@@ -184,7 +186,12 @@ def verify(task, spec, manifest, step, image, timeout=60, runner_factory=DockerR
             # Artifacts are captured into the checkpoint before deleting the workspace.
             # A completed evaluation resumes from this bundle, not from missing temp files.
             def capture():
-                artifacts = [runner.artifact(n) for n in solution["artifacts"]]
+                artifacts, artifact_errors = [], []
+                for name in solution["artifacts"]:
+                    try:
+                        artifacts.append(runner.artifact(name))
+                    except (ValueError, OSError) as exc:
+                        artifact_errors.append({"name": name, "error": str(exc)})
                 destination = step.artifact_dir(key)
                 destination.mkdir(parents=True, exist_ok=True)
                 for artifact in artifacts:
@@ -192,7 +199,8 @@ def verify(task, spec, manifest, step, image, timeout=60, runner_factory=DockerR
                     if target.is_symlink():
                         raise ValueError("refusing symlink in artifact destination")
                     target.write_bytes((runner.work / artifact["name"]).read_bytes())
-                return {"solution": solution, "receipts": runner.receipts, "artifacts": artifacts}
+                return {"solution": solution, "receipts": runner.receipts,
+                        "artifacts": artifacts, "artifact_errors": artifact_errors}
             trials[condition] = step.capture(key, capture)
     grading = step("grade_%s_%d" % (task["id"], attempt), "reviewer", prompts.EVALUATE,
                    {"task": task, "trials": trials})
@@ -202,7 +210,7 @@ def verify(task, spec, manifest, step, image, timeout=60, runner_factory=DockerR
     expected = {m["artifact"] for m in task["milestones"]}
     ran = any(r["exit_code"] == 0 and not r["timed_out"] and not r["output_truncated"]
               for r in real["receipts"])
-    complete = (real["solution"]["status"] == "completed" and ran and
+    complete = (real["solution"]["status"] == "completed" and ran and not real.get("artifact_errors") and
                 expected <= artifacts.keys() and all(artifacts[n]["bytes"] for n in expected))
     # This is evidence for data dependence, not proof; a failed control is inconclusive.
     dependence = (control["solution"]["status"] == "insufficient_data" and

@@ -374,10 +374,13 @@ def run(spec, manifest, out, call, config):
                 if t["review"]["verdict"] == "pass"]})
         with (out / "tasks.csv").open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["task_id", "status", "question", "data_ids", "evidence_ids", "milestones", "unresolved", "review"])
+            writer.writerow(["task_id", "status", "question", "data_ids", "evidence_ids", "milestones", "unresolved",
+                             "execution_verified", "no_data_control_verified", "review"])
             for t in records:
                 row = [t["id"], t["status"], t["question"], ",".join(t["data_ids"]),
-                       ",".join(t["evidence_ids"]), len(t["milestones"]), "; ".join(t["unresolved"]), t["review"]["feedback"]]
+                       ",".join(t["evidence_ids"]), len(t["milestones"]), "; ".join(t["unresolved"]),
+                       t["execution_verified"], t["no_data_control_verified"],
+                       t.get("evaluation", {}).get("feedback", t["review"]["feedback"])]
                 writer.writerow(["'" + v if isinstance(v, str) and v.lstrip().startswith(("=", "+", "-", "@")) else v for v in row])
         state["status"] = "needs_revision" if errors else ("no_tasks" if not records else "completed")
         state.pop("error", None)

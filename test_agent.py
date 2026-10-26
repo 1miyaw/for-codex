@@ -205,11 +205,59 @@ class FrameworkTests(unittest.TestCase):
         received.clear()
         evaluate.verify(task, self.spec, self.manifest, step, "fixture", runner_factory=FakeRunner)
         self.assertEqual([role for _, role, _ in received], ["reviewer"])
+        control_key = next(k for k in bundles if k.endswith("without_data"))
+        bundles[control_key]["solution"]["status"] = "failed"
+        inconclusive = evaluate.verify(task, self.spec, self.manifest, step, "fixture",
+                                       runner_factory=FakeRunner)
+        self.assertFalse(inconclusive["no_data_control_verified"])
+        self.assertEqual(inconclusive["status"], "needs_revision")
         name = next(k for k, v in bundles.items() if v["artifacts"])
         first = bundles[name]["artifacts"][0]
         (step.artifact_dir(name) / first["name"]).write_text("tampered")
         with self.assertRaisesRegex(RuntimeError, "changed"):
             evaluate.verify(task, self.spec, self.manifest, step, "fixture", runner_factory=FakeRunner)
+
+
+    def test_execution_feedback_routes_back_with_bounded_revisions(self):
+        from unittest.mock import patch
+        path = self.root / "data.csv"
+        path.write_text("donor,condition\nA,treated\n")
+        manifest = {k: dict(v, available=True, path=str(path), sha256=agent.file_digest(path))
+                    for k, v in self.manifest.items()}
+        seen, attempts = [], []
+        def client(stage, system, payload):
+            seen.append(stage)
+            alias = "review_0" if stage.startswith("execution_review") else stage
+            return agent.demo_team(alias, system, payload)
+        def fake_verify(task, spec, files, step, image, timeout, attempt=0):
+            attempts.append(attempt)
+            return {"status": "needs_revision" if attempt == 0 else "needs_human_review",
+                    "execution_verified": attempt > 0, "no_data_control_verified": attempt > 0,
+                    "evaluation": {"feedback": "missing artifact" if attempt == 0 else "checked"},
+                    "trials": {}}
+        with patch("evaluate.verify", side_effect=fake_verify):
+            result = agent.run(self.spec, manifest, self.root, client,
+                               dict(self.config, demo=False, verify=True, image="fixture"))
+        self.assertEqual(attempts, [0, 1])
+        self.assertTrue(any(x.startswith("execution_revise") for x in seen))
+        self.assertTrue(any(x.startswith("execution_review") for x in seen))
+        self.assertEqual(result["tasks"][0]["status"], "needs_human_review")
+        self.assertFalse(result["benchmark_ready"])
+        self.assertEqual(len(result["tasks"][0]["verification_history"]), 2)
+
+    def test_rejected_task_never_reaches_solver(self):
+        from unittest.mock import patch
+        def client(stage, system, request):
+            value = json.loads(agent.demo_team(stage, system, request))
+            if stage.startswith("review") and value.get("action") == "final":
+                for review in value["result"]["reviews"]:
+                    review["verdict"] = "reject"
+            return json.dumps(value)
+        with patch("evaluate.verify") as verify:
+            result = agent.run(self.spec, self.manifest, self.root, client,
+                               dict(self.config, demo=False, verify=True, image="fixture"))
+        verify.assert_not_called()
+        self.assertEqual(result["tasks"][0]["status"], "rejected")
 
     @unittest.skipUnless(os.environ.get("OMICS_TEST_IMAGE"), "optional real Docker check")
     def test_docker_executes_without_gold(self):
