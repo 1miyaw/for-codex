@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Evidence -> task proposals -> bounded review/revision -> JSON and CSV.
-
-Python 3.9+, standard library. Does not execute generated research code.
-"""
+"""Five-role omics task team: literature, data, design, blind solve, review."""
 import argparse
 import csv
 import hashlib
@@ -15,6 +12,8 @@ import urllib.parse
 import urllib.request
 
 import prompts
+import team
+import evaluate
 
 CHECKS = ("atomic_target", "data_dependency", "judgment", "no_leakage", "evidence_scope")
 TRACKS = ("method_reproduction", "result_reproduction", "exploration")
@@ -119,6 +118,7 @@ def validate_tasks(draft, spec, evidence, previous_ids=None):
         visited, decisions, edges = set(), 0, 0
         graph = {key: set() for key in milestones}
         for m in milestones.values():
+            evaluate.check_artifact(m.get("artifact"))
             for field in ("goal", "artifact", "acceptance"):
                 require(text(m.get(field)), "milestone missing " + field)
             require(isinstance(m.get("decision"), str), "decision must be a string")
@@ -237,37 +237,69 @@ def demo_response(stage, system, payload):
     return json.dumps(result, ensure_ascii=False)
 
 
+def demo_team(stage, system, request):
+    """Scripted agent/tool loop; no LLM and no scientific execution."""
+    payload, history = request["context"], request["history"]
+    if stage == "extract" and not history:
+        return json.dumps({"action": "tool", "name": "read_source",
+                           "arguments": {"source_id": payload["sources"][0]["id"]}})
+    if stage == "audit":
+        data = payload["data"]
+        if len(history) < len(data):
+            return json.dumps({"action": "tool", "name": "inspect_data",
+                               "arguments": {"data_id": data[len(history)]["id"]}})
+        result = {"datasets": [{"data_id": d["id"],
+                  "status": "uncertain" if payload["files"][d["id"]]["available"] else "missing",
+                  "observed": ["离线夹具，真实工具预览见轨迹。"],
+                  "limitations": ["不是模型或科研验证。"]} for d in data]}
+    else:
+        result = json.loads(demo_response(stage, system, dict(payload, input=payload.get("input", {}))))
+    return json.dumps({"action": "final", "result": result}, ensure_ascii=False)
+
+
 def run(spec, manifest, out, call, config):
     fingerprint = digest({"input": spec, "data": manifest, "config": config,
-                          "code": [file_digest(Path(__file__)), file_digest(Path(prompts.__file__))]})
+                          "code": [file_digest(Path(module.__file__))
+                                   for module in (sys.modules[__name__], prompts, team, evaluate)]})
     state_path = out / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {
-        "fingerprint": fingerprint, "config": config, "calls": {}}
+        "fingerprint": fingerprint, "config": config, "calls": {}, "bundles": {}}
     require(state.get("fingerprint") == fingerprint, "input/model/code/data changed; choose a new --out directory")
+    save = lambda: write_json(state_path, state)
 
-    def step(name, system, payload):
-        key = digest({"system": system, "payload": payload})
-        if name not in state["calls"]:
-            raw = call(name, system, payload)
-            state["calls"][name] = {"request_hash": key, "raw": raw}
-            write_json(state_path, state)
-        record = state["calls"][name]
-        require(record["request_hash"] == key, "cached stage payload changed: " + name)
-        try:
-            result = json.loads(record["raw"])
-        except json.JSONDecodeError:
-            raise ValueError(name + " returned invalid JSON; raw response retained in state.json") from None
-        require(isinstance(result, dict), name + " must return a JSON object")
-        return result
+    def step(name, role, system, payload, tools=None):
+        record = state["calls"].setdefault(name, {})
+        client = call.get(role) if isinstance(call, dict) else call
+        require(callable(client), "missing client for " + role)
+        actor = team.Agent(role, client, tools, config.get("max_turns", 8))
+        return actor.run(name, system, payload, record, save)
 
+    def capture(name, collect):
+        if name not in state["bundles"]:
+            state["bundles"][name] = collect()
+            save()
+        return state["bundles"][name]
+
+    step.capture = capture
+    step.bundle = lambda name: state["bundles"].get(name)
+    step.started = lambda name: bool(state["calls"].get(name))
+    step.artifact_dir = lambda name: out / "artifacts" / digest(name)[:16]
     base = {"input": spec, "file_manifest": manifest}
     try:
-        extraction = step("extract", prompts.EXTRACT, base)
+        # Literature reads sources; data specialist never sees source conclusions.
+        literature_input = {"title": spec["title"], "sources": [
+            {"id": s["id"], "citation": s["citation"], "characters": len(s["text"])}
+            for s in spec["sources"]]}
+        extraction = step("extract", "literature", prompts.EXTRACT, literature_input,
+                          team.source_tools(spec))
         evidence = validate_evidence(extraction, spec)
+        audit = step("audit", "data", prompts.AUDIT,
+                     {"data": spec["data"], "files": manifest}, team.data_tools(manifest))
+        team.validate_audit(audit, manifest, state["calls"]["audit"])
         draft, reviews, errors, previous_ids = {"tasks": [], "gaps": []}, {}, [], None
         if evidence:
-            context = dict(base, extraction=extraction)
-            draft = step("generate", prompts.GENERATE, context)
+            context = dict(base, extraction=extraction, data_audit=audit)
+            draft = step("generate", "designer", prompts.GENERATE, context)
             for attempt in range(config["max_revisions"] + 1):
                 errors, reviews = [], {}
                 try:
@@ -278,12 +310,12 @@ def run(spec, manifest, out, call, config):
                 if not errors:
                     previous_ids = list(tasks)
                     if tasks:
-                        response = step("review_%d" % attempt, prompts.REVIEW, dict(context, draft=draft))
+                        response = step("review_%d" % attempt, "reviewer", prompts.REVIEW, dict(context, draft=draft))
                         reviews = validate_reviews(response, tasks)
                 needs_revision = errors or any(r["verdict"] == "revise" for r in reviews.values())
                 if not needs_revision or attempt == config["max_revisions"]:
                     break
-                draft = step("revise_%d" % (attempt + 1), prompts.REVISE,
+                draft = step("revise_%d" % (attempt + 1), "designer", prompts.REVISE,
                              dict(context, draft=draft, errors=errors, reviews=list(reviews.values())))
         records = []
         if not errors:
@@ -296,17 +328,50 @@ def run(spec, manifest, out, call, config):
                     status = "demo_only"
                 records.append(dict(t, status=status, review=reviews[t["id"]],
                                     execution_verified=False, no_data_control_verified=False))
+        if config.get("verify"):
+            for index, task in enumerate(records):
+                if task["status"] != "needs_execution":
+                    continue
+                history = []
+                for attempt in range(config["max_revisions"] + 1):
+                    checked = evaluate.verify(task, spec, manifest, step, config["image"],
+                                              config.get("execution_timeout", 60),
+                                              attempt=attempt)
+                    history.append({"attempt": attempt, **checked})
+                    task.update(checked)
+                    if task["status"] != "needs_revision" or attempt == config["max_revisions"]:
+                        break
+                    # Route concrete execution feedback back to the designer.
+                    revised = step("execution_revise_%s_%d" % (task["id"], attempt), "designer",
+                                   prompts.REVISE, dict(context,
+                                   draft={"tasks": [task], "gaps": []}, errors=[],
+                                   reviews=[checked["evaluation"]]))
+                    validate_tasks(revised, spec, evidence, [task["id"]])
+                    candidate = revised["tasks"][0]
+                    review = step("execution_review_%s_%d" % (task["id"], attempt), "reviewer",
+                                  prompts.REVIEW, dict(context, draft=revised))
+                    verdict = validate_reviews(review, {candidate["id"]: candidate})[candidate["id"]]
+                    task = dict(candidate, review=verdict, execution_verified=False,
+                                no_data_control_verified=False, status="needs_revision")
+                    if verdict["verdict"] != "pass":
+                        task["status"] = "rejected" if verdict["verdict"] == "reject" else "needs_revision"
+                        break
+                    if any(not manifest[k]["available"] for k in task["data_ids"]):
+                        task["status"] = "needs_data"
+                        break
+                task["verification_history"] = history
+                records[index] = task
         packet = {"title": spec["title"], "track": spec["track"], "demo": config["demo"],
                   "benchmark_ready": False, "file_manifest": manifest, "sources": spec["sources"],
-                  "evidence": extraction["evidence"], "tasks": records,
+                  "evidence": extraction["evidence"], "data_audit": audit, "tasks": records,
                   "gaps": extraction["gaps"] + (draft.get("gaps", []) if isinstance(draft.get("gaps"), list) else []),
                   "validation_errors": errors}
         write_json(out / "tasks.json", packet)
-        # Solver package deliberately omits sources, evidence, reference answers and reviewer feedback.
-        solver_tasks = [{k: t[k] for k in ("id", "question", "data_ids", "milestones", "status")}
-                        for t in records if t["review"]["verdict"] == "pass"]
-        write_json(out / "solver.json", {"track": spec["track"], "demo": config["demo"],
-                   "data": spec["data"], "tasks": solver_tasks})
+        # Public handoff is opt-in; the evaluator consumes it in memory by default.
+        if config.get("export_solver"):
+            write_json(out / "solver.json", {"tasks": [
+                team.solver_packet(t, spec, manifest) for t in records
+                if t["review"]["verdict"] == "pass"]})
         with (out / "tasks.csv").open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["task_id", "status", "question", "data_ids", "evidence_ids", "milestones", "unresolved", "review"])
@@ -332,15 +397,33 @@ def main():
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"))
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
     parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--max-turns", type=int, default=8, help="per-agent turn budget, 1..64")
+    parser.add_argument("--role-model", action="append", default=[], metavar="ROLE=MODEL")
+    parser.add_argument("--verify", action="store_true", help="run blind solver and no-data control in Docker")
+    parser.add_argument("--image", help="trusted preinstalled Python image containing analysis packages")
+    parser.add_argument("--execution-timeout", type=float, default=60)
+    parser.add_argument("--export-solver", action="store_true", help="also export a public solver handoff")
     parser.add_argument("--max-revisions", type=int, choices=range(3), default=1)
     args = parser.parse_args()
     try:
+        require(1 <= args.max_turns <= 64, "max-turns must be 1..64")
+        require(args.execution_timeout > 0, "execution-timeout must be positive")
+        require(not (args.demo and args.verify), "--demo cannot verify real execution")
         require(args.timeout > 0, "timeout must be positive")
         require(not args.demo or args.input is None, "--demo uses only the bundled synthetic example")
         require(args.demo or args.input is not None, "provide an input JSON or use --demo")
         path = Path(__file__).with_name("example.json") if args.demo else args.input.resolve()
         spec, manifest = load_input(path)
-        client = demo_response if args.demo else Client(args.model, args.base_url, args.timeout)
+        models = {}
+        for item in args.role_model:
+            role, separator, model = item.partition("=")
+            require(separator and role in team.ROLES and text(model), "use --role-model ROLE=MODEL")
+            require(role not in models, "duplicate role-model: " + role)
+            models[role] = model
+        image = evaluate.DockerRunner.resolve_image(args.image) if args.verify else None
+        client = demo_team if args.demo else {
+            role: Client(models.get(role, args.model), args.base_url, args.timeout) for role in team.ROLES}
+
         args.out.mkdir(parents=True, exist_ok=True)
         # A single output directory is one run; never use it concurrently.
         import fcntl
@@ -349,7 +432,10 @@ def main():
             packet = run(spec, manifest, args.out, client,
                          {"demo": args.demo, "model": "fixture" if args.demo else args.model,
                           "base_url": None if args.demo else args.base_url,
-                          "max_revisions": args.max_revisions})
+                          "max_revisions": args.max_revisions, "max_turns": args.max_turns,
+                          "role_models": models, "verify": args.verify, "image": image,
+                          "execution_timeout": args.execution_timeout,
+                          "export_solver": args.export_solver})
         print(json.dumps({"out": str(args.out.resolve()), "tasks": len(packet["tasks"]),
                           "benchmark_ready": False, "validation_errors": packet["validation_errors"]}, ensure_ascii=False))
         return 2 if packet["validation_errors"] else 0
