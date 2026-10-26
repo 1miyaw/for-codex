@@ -1,0 +1,19 @@
+{
+  "title": "合成示例：bulk RNA 治疗反应复现任务",
+  "track": "result_reproduction",
+  "max_tasks": 1,
+  "sources": [
+    {
+      "id": "S1",
+      "citation": "SYNTHETIC DEMO. Not a real publication or biological finding.",
+      "text": "Synthetic example only. A fictional paired bulk RNA study compared pretreatment and post-treatment samples from the same donors. The authors reported reduced interferon-response activity after treatment, while the magnitude varied across donors. They used within-donor contrasts and gene-set analysis. This association does not establish a treatment mechanism. The example supplies no measured effect size or significance value."
+    }
+  ],
+  "data": [
+    {
+      "id": "D1",
+      "path": null,
+      "description": "待提供：bulk RNA 表达矩阵、基因标识、配对 donor ID、治疗时间标签及批次元数据。path=null 表示尚未提供文件，不能声称已验证数据可用。"
+    }
+  ]
+}
